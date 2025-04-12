@@ -1,235 +1,166 @@
-import numpy as np
-from scipy.fftpack import dct, idct
-from scipy.sparse import diags
-from scipy.sparse.linalg import bicgstab, spilu, LinearOperator
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.animation import FuncAnimation
+from numpy import ndarray
 
-def calculate_cfl_timestep(u, v, dx, dy, Re):
-    """
-    Calculate the maximum safe time step based on CFL condition
-    
-    Parameters:
-    u, v : velocity fields
-    dx, dy : grid spacing
-    Re : Reynolds number
-    
-    Returns:
-    Recommended time step
-    """
-    # Maximum velocity magnitude
-    max_u = np.max(np.abs(u))
-    max_v = np.max(np.abs(v))
-    
-    # Convective CFL condition
-    cfl_conv_x = dx / (max_u + 1e-10)
-    cfl_conv_y = dy / (max_v + 1e-10)
-    
-    # Diffusive CFL condition (based on viscosity)
-    nu = 1 / Re  # Kinematic viscosity
-    cfl_diff_x = 0.5 * Re * dx**2
-    cfl_diff_y = 0.5 * Re * dy**2
-    
-    # Take the minimum to be conservative
-    dt_conv = 0.5 * min(cfl_conv_x, cfl_conv_y)
-    dt_diff = 0.5 * min(cfl_diff_x, cfl_diff_y)
-    
-    # Choose teh smaller timestep
-    dt = min(dt_conv, dt_diff)
-    
-    print(f"CFL Analysis:")
-    print(f"Max U: {max_u:.4f}, Max V: {max_v:.4f}")
-    print(f"Convective CFL dt_x: {cfl_conv_x:.6f}, dt_y: {cfl_conv_y:.6f}")
-    print(f"Diffusive CFL dt_x: {cfl_diff_x:.6f}, dt_y: {cfl_diff_y:.6f}")
-    print(f"Recommended dt: {dt:.6f}")
-    
-    return dt
+# Constants
+N_POINTS: int = 128
+N_ITERATIONS: int = 300  # Increase the number of iterations for more steps
+N_PRESSURE_POISSON_ITERATIONS: int = 50
+TIME_STEP: float = 0.000003  # Smaller time step length for stability
+KINEMATIC_VISCOSITY: float = 0.1
+HORIZONTAL_VELOCITY: float = 1.0
+EPSILON: float = 1e-6  # Small value to avoid zero range for contour levels
+DENSITY: float = 1.0
 
+# Functions
+def central_difference_x(f: ndarray, element_length: float) -> ndarray:
+    diff = np.zeros_like(f)
+    diff[:, 1:-1] = (f[:, 2:] - f[:, :-2]) / (2 * element_length)
+    return diff
 
-def solvePoissonEquation_2dDCT(b, Nx, Ny, dx, dy):
-    # wavenumber
-    kx = np.arange(Nx)
-    ky = np.arange(Ny)
-    mwx = 2 * (np.cos(np.pi * kx / Nx) - 1) / dx**2
-    mwy = 2 * (np.cos(np.pi * ky / Ny) - 1) / dy**2
+def central_difference_y(f: ndarray, element_length: float) -> ndarray:
+    diff = np.zeros_like(f)
+    diff[1:-1, :] = (f[2:, :] - f[:-2, :]) / (2 * element_length)
+    return diff
 
-    # 2D DCT of b (Right hand side)
-    bhat = dct(dct(b.T, norm='ortho').T, norm='ortho')
+def laplace(f: ndarray, element_length: float) -> ndarray:
+    lap = np.zeros_like(f)
+    lap[1:-1, 1:-1] = (f[1:-1, :-2] + f[:-2, 1:-1] + f[1:-1, 2:] + f[2:, 1:-1] - 4 * f[1:-1, 1:-1]) / (element_length**2)
+    return lap
 
-    MWX, MWY = np.meshgrid(mwx, mwy, indexing='ij')
-    phat = bhat / (MWX + MWY)
+def apply_boundary_conditions(u: ndarray, v: ndarray, horizontal_velocity_top: float) -> tuple[ndarray, ndarray]:
+    u[0, :], u[:, 0], u[:, -1], u[-1, :] = 0.0, 0.0, 0.0, horizontal_velocity_top
+    v[0, :], v[:, 0], v[:, -1], v[-1, :] = 0.0, 0.0, 0.0, 0.0
+    return u, v
 
-    # The solution is not unique (phat[0, 0] = inf);
-    denominator = MWX + MWY
-
-    # Avoid division by zero
-    denominator[0, 0] = 1  # Set the (0,0) term to 1 to avoid division by zero
-    phat = bhat / denominator
-    # Here we fix the mean (with kx=0, ky=0) to be 0
-    phat[0, 0] = 0
-
-    # Inverse 2D DCT
-    p = idct(idct(phat.T, norm='ortho').T, norm='ortho')
-
-
+def solve_pressure_poisson(p: ndarray, rhs: ndarray, element_length: float) -> ndarray:
+    for _ in range(N_PRESSURE_POISSON_ITERATIONS):
+        p_next = np.copy(p)
+        p_next[1:-1, 1:-1] = 0.25 * (p[1:-1, :-2] + p[:-2, 1:-1] + p[1:-1, 2:] + p[2:, 1:-1] - element_length**2 * rhs[1:-1, 1:-1])
+        p_next[:, -1] = p_next[:, -2]
+        p_next[0, :] = p_next[1, :]
+        p_next[:, 0] = p_next[1, :]
+        p_next[-1, :] = 0.0
+        p = p_next
     return p
 
+def main() -> None:
+    element_length = 1.0 / (N_POINTS - 1)
+    x = np.linspace(0.0, 1.0, N_POINTS)
+    y = np.linspace(0.0, 1.0, N_POINTS)
+    X, Y = np.meshgrid(x, y)
 
-    return p
-def solvePoissonEquation(b, Nx, Ny, dx, dy, tol=1e-20, max_iter=10000):
-    """
-    Solves the Poisson equation using the Gauss-Seidel method.
+    u = np.zeros((N_POINTS, N_POINTS))
+    v = np.zeros((N_POINTS, N_POINTS))
+    p = np.zeros((N_POINTS, N_POINTS))
 
-    Parameters:
-    b : ndarray
-        Right-hand side of the Poisson equation
-    Nx, Ny : int
-        Number of grid points in the x and y directions
-    dx, dy : float
-        Grid spacing in x and y directions
-    tol : float
-        Convergence tolerance
-    max_iter : int
-        Maximum number of iterations
+    # Initialize with a small perturbation to help with the flow
+    u[:, :] = 0.1
 
-    Returns:
-    p : ndarray
-        Solution to the Poisson equation
-    """
-    # Initialize the pressure field
-    p = np.zeros_like(b)
-    dx2, dy2 = dx**2, dy**2
-    factor = 1 / (2 * (1 / dx2 + 1 / dy2))
+    fig, axs = plt.subplots(1, 2, figsize=(12, 6), facecolor='black')
+    plt.subplots_adjust(wspace=0.4, hspace=0.4)
 
-    # Gauss-Seidel iteration
-    for it in range(max_iter):
-        p_old = p.copy()
+    ax_u = axs[0]
+    ax_v = axs[1]
 
-        for i in range(1, Nx-1):
-            for j in range(1, Ny-1):
-                p[i, j] = factor * ((p[i+1, j] + p[i-1, j]) / dx2 +
-                                    (p[i, j+1] + p[i, j-1]) / dy2 - b[i, j])
+    # Set titles and labels to white
+    ax_u.set_title("Velocity (u)", color='white')
+    ax_v.set_title("Velocity (v)", color='white')
 
-        # Check for convergence
-        error = np.linalg.norm(p - p_old, ord=2)
-        if error < tol:
-            print(f"Converged in {it+1} iterations with error {error:.2e}")
-            break
+    ax_u.set_xlim(0, 1.0)
+    ax_u.set_ylim(0, 1.0)
+    ax_u.set_aspect('equal')
 
-    return p
+    ax_v.set_xlim(0, 1.0)
+    ax_v.set_ylim(0, 1.0)
+    ax_v.set_aspect('equal')
 
+    # Set axis labels and ticks to white
+    for ax in axs:
+        ax.tick_params(colors='white')
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        ax.spines['top'].set_color('white')
+        ax.spines['bottom'].set_color('white')
+        ax.spines['left'].set_color('white')
+        ax.spines['right'].set_color('white')
 
-Re = 1000  # Reynolds number
-nt = 20000  # max time steps
-Lx = 1
-Ly = 1  # domain size
-Nx = 80
-Ny = 80  # Number of grids
-dt = 0.0005  # time step
+    # Initial contour plots
+    contour_u = ax_u.contourf(X, Y, u, cmap="coolwarm", levels=np.linspace(np.min(u), np.max(u) + EPSILON, 20))
+    colorbar_u = fig.colorbar(contour_u, ax=ax_u)
+    colorbar_u.ax.yaxis.set_tick_params(color='white')
+    colorbar_u.ax.yaxis.set_tick_params(color='white')
+    colorbar_u.outline.set_edgecolor('white')
+    plt.setp(plt.getp(colorbar_u.ax.axes, 'yticklabels'), color='white')
 
-# Grid size (Equispaced)
-dx = Lx / Nx
-dy = Ly / Ny
+    contour_v = ax_v.contourf(X, Y, v, cmap="coolwarm", levels=np.linspace(np.min(v), np.max(v) + EPSILON, 20))
+    colorbar_v = fig.colorbar(contour_v, ax=ax_v)
+    colorbar_v.ax.yaxis.set_tick_params(color='white')
+    colorbar_v.outline.set_edgecolor('white')
+    plt.setp(plt.getp(colorbar_v.ax.axes, 'yticklabels'), color='white')
 
-# Coordinate of each grid (cell center)
-xce = (np.arange(1, Nx + 1) - 0.5) * dx
-yce = (np.arange(1, Ny + 1) - 0.5) * dy
+    # Text annotation for current iteration
+    iteration_text = fig.suptitle('Iteration: 0', color='white')
 
-# Coordinate of each grid (cell corner)
-xco = np.arange(0, Nx + 1) * dx
-yco = np.arange(0, Ny + 1) * dy
+    def update(frame: int) -> None:
+        nonlocal u, v, p, contour_u, contour_v, colorbar_u, colorbar_v
+        for _ in range(50):  # Inner loop for more steps per frame
+            d_u_dx = central_difference_x(u, element_length)
+            d_u_dy = central_difference_y(u, element_length)
+            d_v_dx = central_difference_x(v, element_length)
+            d_v_dy = central_difference_y(v, element_length)
+            laplace_u = laplace(u, element_length)
+            laplace_v = laplace(v, element_length)
 
-# Data arrays
-u = np.zeros((Nx + 1, Ny + 2))  # velocity in x direction (u)
-v = np.zeros((Nx + 2, Ny + 1))  # velocity in y direction (v)
-p = np.zeros((Nx, Ny))  # pressure (lagrange multiplier)
+            # Calculate tentative velocities
+            u_tent = u + TIME_STEP * (-(u * d_u_dx + v * d_u_dy) + KINEMATIC_VISCOSITY * laplace_u)
+            v_tent = v + TIME_STEP * (-(u * d_v_dx + v * d_v_dy) + KINEMATIC_VISCOSITY * laplace_v)
 
-for ii in range(nt):
-    bctop = 10  # Top lid u
-    
-    calculate_cfl_timestep(u, v, dx, dy, Re)
-    
-    if ii > 1000:
-        bctop = -1
-    if ii > 2000:
-        bctop = 1   
-    
-    u[:, 0] = -u[:, 1]
-    v[:, 0] = 0  # bottom
-    u[:, -1] = 2 * bctop - u[:, -2]
-    v[:, -1] = 0  # top
-    u[0, :] = 0
-    v[0, :] = -v[1, :]  # left
-    u[-1, :] = 0
-    v[-1, :] = -v[-2, :]  # right
+            u, v = apply_boundary_conditions(u_tent, v_tent, HORIZONTAL_VELOCITY)
 
-    Lux = (u[:-2, 1:-1] - 2 * u[1:-1, 1:-1] + u[2:, 1:-1]) / dx**2
-    Luy = (u[1:-1, :-2] - 2 * u[1:-1, 1:-1] + u[1:-1, 2:]) / dy**2
-    Lvx = (v[:-2, 1:-1] - 2 * v[1:-1, 1:-1] + v[2:, 1:-1]) / dx**2
-    Lvy = (v[1:-1, :-2] - 2 * v[1:-1, 1:-1] + v[1:-1, 2:]) / dy**2
+            # Calculate the divergence of the velocity field
+            rhs = (d_u_dx + d_v_dy) / TIME_STEP
+            p = solve_pressure_poisson(p, rhs, element_length)
 
-    # 1. interpolate velocity at cell center/cell corner
-    uce = (u[:-1, 1:-1] + u[1:, 1:-1]) / 2
-    uco = (u[:, :-1] + u[:, 1:]) / 2
-    vco = (v[:-1, :] + v[1:, :]) / 2
-    vce = (v[1:-1, :-1] + v[1:-1, 1:]) / 2
+            d_p_dx = central_difference_x(p, element_length)
+            d_p_dy = central_difference_y(p, element_length)
 
-    # 2. multiply
-    uuce = uce * uce
-    uvco = uco * vco
-    vvce = vce * vce
+            u = u - TIME_STEP / DENSITY * d_p_dx
+            v = v - TIME_STEP / DENSITY * d_p_dy
 
-    # 3-1. get derivative for u
-    Nu = (uuce[1:, :] - uuce[:-1, :]) / dx
-    Nu += (uvco[1:-1, 1:] - uvco[1:-1, :-1]) / dy
+            u, v = apply_boundary_conditions(u, v, HORIZONTAL_VELOCITY)
 
-    # 3-2. get derivative for v
-    Nv = (vvce[:, 1:] - vvce[:, :-1]) / dy
-    Nv += (uvco[1:, 1:-1] - uvco[:-1, 1:-1]) / dx
+        # Debug prints to verify intermediate values
+        print(f"Frame: {frame + 1}")
+        print(f"Max u: {np.max(u)}, Max v: {np.max(v)}, Max p: {np.max(p)}")
 
-    # Get intermediate velocity
-    u[1:-1, 1:-1] += dt * (-Nu + (Lux + Luy) / Re)
-    v[1:-1, 1:-1] += dt * (-Nv + (Lvx + Lvy) / Re)
+        # Remove previous contour plots and color bars
+        for c in contour_u.collections:
+            c.remove()
+        for c in contour_v.collections:
+            c.remove()
+        colorbar_u.remove()
+        colorbar_v.remove()
 
-    # velocity correction
-    # RHS of pressure Poisson eq.
-    b = ((u[1:, 1:-1] - u[:-1, 1:-1]) / dx +
-         (v[1:-1, 1:] - v[1:-1, :-1]) / dy)
+        # Update contour plots
+        contour_u = ax_u.contourf(X, Y, u, cmap="coolwarm", levels=np.linspace(np.min(u), np.max(u) + EPSILON, 20))
+        colorbar_u = fig.colorbar(contour_u, ax=ax_u)
+        colorbar_u.ax.yaxis.set_tick_params(color='white')
+        colorbar_u.outline.set_edgecolor('white')
+        plt.setp(plt.getp(colorbar_u.ax.axes, 'yticklabels'), color='white')
 
-    # Solve for p (using cosine transform, faster)
-    p = solvePoissonEquation_2dDCT(b, Nx, Ny, dx, dy)
-    # Direct Method
-    #p = solvePoissonEquation(b, Nx, Ny, dx, dy)
+        contour_v = ax_v.contourf(X, Y, v, cmap="coolwarm", levels=np.linspace(np.min(v), np.max(v) + EPSILON, 20))
+        colorbar_v = fig.colorbar(contour_v, ax=ax_v)
+        colorbar_v.ax.yaxis.set_tick_params(color='white')
+        colorbar_v.outline.set_edgecolor('white')
+        plt.setp(plt.getp(colorbar_v.ax.axes, 'yticklabels'), color='white')
 
-    # The new divergent free velocity field
-    u[1:-1, 1:-1] -= (p[1:, :] - p[:-1, :]) / dx
-    v[1:-1, 1:-1] -= (p[:, 1:] - p[:, :-1]) / dy
+        # Update the iteration text
+        iteration_text.set_text(f'Iteration: {frame + 1}/{N_ITERATIONS}')
 
-    divergence = np.abs((u[1:, 1:-1] - u[:-1, 1:-1]) / dx + (v[1:-1, 1:] - v[1:-1, :-1]) / dy)
-    max_divergence = np.max(divergence)
-    print(f"Time step {ii+1}, Max Divergence: {max_divergence:.2e}")
+    ani = FuncAnimation(fig, update, frames=range(N_ITERATIONS), repeat=False)
+    plt.show()
 
-
-    if(ii%100==0):
-        # Calculate velocity at cell centers
-        uce = (u[:-1, 1:-1] + u[1:, 1:-1]) / 2
-        vce = (v[1:-1, :-1] + v[1:-1, 1:]) / 2
-
-        # Create a meshgrid for plotting
-        X, Y = np.meshgrid(xce, yce, indexing='ij')
-
-        # Plot the vector field and pressure field side by side
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-
-        # Plot the velocity vector field
-        ax1.quiver(X, Y, uce, vce)
-        ax1.set_xlabel('X')
-        ax1.set_ylabel('Y')
-        ax1.set_title('Velocity Vector Field')
-
-        # Plot the pressure field
-        pressure_plot = ax2.imshow(p.T, origin='lower', extent=[xce[0], xce[-1], yce[0], yce[-1]], aspect='auto',cmap='plasma')
-        ax2.set_xlabel('X')
-        ax2.set_ylabel('Y')
-        ax2.set_title('Pressure Field')
-        fig.colorbar(pressure_plot, ax=ax2, orientation='vertical')
-        plt.show()
+if __name__ == "__main__":
+    main()
